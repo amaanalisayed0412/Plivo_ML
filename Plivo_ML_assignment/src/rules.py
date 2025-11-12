@@ -2,74 +2,72 @@ import re
 from typing import List, Set, Tuple, Dict
 from rapidfuzz import process, fuzz
 
-# --- 1. Misspellings (NEW) ---
-# This is a high-precision, fast-win.
-# Should be passed in from misspell_map.json
-def correct_common_misspells(text: str, misspell_map: Dict[str, str]) -> str:
-    # Use a regex to replace only whole words
-    # This is much faster than splitting and iterating
-    pattern = re.compile(r'\b(' + '|'.join(re.escape(k) for k in misspell_map.keys()) + r')\b', re.IGNORECASE)
-    return pattern.sub(lambda m: misspell_map[m.group(0).lower()], text)
 
-# --- 2. Email Normalization (Improved) ---
+# For correct_common_misspells (dynamic, compiled in function)
+
+
+# For normalize_email_tokens
 EMAIL_TOKEN_PATTERNS = [
-    (r'\b(dot)\b', '.'),                  # 'dot' -> '.'
-    (r'\b(underscore)\b', '_'),          # 'underscore' -> '_'
+    (re.compile(r'\b(dot)\b', re.IGNORECASE), '.'),
+    (re.compile(r'\b(underscore)\b', re.IGNORECASE), '_'),
 ]
 EMAIL_CLEANUP_PATTERNS = [
+    # (BUGFIX) Handle "g mail", "y hoo", etc.
+    (re.compile(r'\b(g)\s+(mail)\b', re.IGNORECASE), r'gmail'),
+    (re.compile(r'\b(y)\s+(hoo)\b', re.IGNORECASE), r'yahoo'),
+    
     # Fixes the (.) before surname (mehta) in the email address.
-    (r'([a-zA-Z0-9.-]+)(mehta|sharma|patel|gupta|singh|kumar|verma)\b', r'\1.\2'),
-
-    # Fixes "...acin" -> "...ac.in"
-    (r'(@[a-zA-Z0-9.-]+)(acin)\b', r'\1.ac.in'),
+    (re.compile(r'([a-zA-Z0-9.-]+)(mehta|sharma|patel|gupta|singh|kumar|verma)\b', re.IGNORECASE), r'\1.\2'),
     
-    # Fixes "...coin" -> "...co.in"
-    (r'(@[a-zA-Z0-9.-]+)(coin)\b', r'\1.co.in'),
+    # TLD fixes (order matters: specific 'acin'/'coin' first)
+    (re.compile(r'(@[a-zA-Z0-9.-]+)(acin)\b', re.IGNORECASE), r'\1.ac.in'),
+    (re.compile(r'(@[a-zA-Z0-9.-]+)(coin)\b', re.IGNORECASE), r'\1.co.in'),
+    (re.compile(r'(@[a-zA-Z0-9.-]+)(com|in|org|net|edu)\b', re.IGNORECASE), r'\1.\2'),
     
-    # Fixes "...com" -> "...com", "...in" -> ".in", etc.
-    (r'(@[a-zA-Z0-9.-]+)(com|in|org|net|edu)\b', r'\1.\2'),
-    
-    # --- ORIGINAL PATTERN ---
     # Cleans up spaces: 'user @ gmail . com' -> 'user@gmail.com'
-    (r'\s*([@\.])\s*', r'\1'),
+    (re.compile(r'\s*([@\.])\s*'), r'\1'),
 ]
 
-ASR_AT_ERROR_PATTERNS = [
-    (r'\b(listed|close|reply|email me|reach me)\s*@', r'\1 at'),
+# For normalize_indian_units
+SMALL_NUM_PATTERNS = [
+    (re.compile(r'\bone\b', re.IGNORECASE), '1'),
+    (re.compile(r'\btwo\b', re.IGNORECASE), '2'),
+    # (add more as needed)
 ]
+INDIAN_UNIT_PATTERN = re.compile(r'(\d[\d,.]*)\s+(lakh|crore)\b', re.IGNORECASE)
+THOUSAND_PATTERN = re.compile(r'(\d[\d,.]*)\s+thousand\b', re.IGNORECASE)
 
-def fix_asr_at_errors(s: str) -> str:
-    """
-    Corrects common ASR errors where "at" is transcribed as "@"
-    in non-email contexts (e.g., "reach me@" -> "reach me at").
-    """
-    for pat, rep in ASR_AT_ERROR_PATTERNS:
-        s = re.sub(pat, rep, s, flags=re.IGNORECASE)
-    return s
+# For indian_group
+INDIAN_GROUPING_PATTERN = re.compile(r'(\d)(?=(\d\d)+\d$)')
+
+# For normalize_currency
+CURRENCY_SYMBOL_PATTERN = re.compile(r'\b(rupees|rs)\b\s*', re.IGNORECASE)
+CURRENCY_FORMAT_PATTERN = re.compile(r'(₹)\s*([0-9,]+)\b')
+
+# --- 2. Misspellings ---
+def correct_common_misspells(text: str, misspell_map: Dict[str, str]) -> str:
+
+    single_word_keys = [k for k in misspell_map.keys() if ' ' not in k]
+    if not single_word_keys:
+        return text
+
+    pattern = re.compile(r'\b(' + '|'.join(re.escape(k) for k in single_word_keys) + r')\b', re.IGNORECASE)
+    return pattern.sub(lambda m: misspell_map[m.group(0).lower()], text)
+
 
 def collapse_spelled_letters(s: str) -> str:
-    """
-    Improved: Handles variable-length letter sequences.
-    e.g., 'g m a i l' -> 'gmail' (4 letters)
-    e.g., 's m i t h' -> 'smith' (5 letters)
-    """
     tokens = s.split()
     out = []
     i = 0
     while i < len(tokens):
-        # Find start of a single-letter sequence
         if len(tokens[i]) == 1 and tokens[i].isalpha():
             j = i + 1
-            # Greedily consume all subsequent single letters
             while j < len(tokens) and len(tokens[j]) == 1 and tokens[j].isalpha():
                 j += 1
-            
-            # If we found a sequence (e.g., > 2 letters), collapse it
             if j - i >= 2:
                 out.append(''.join(tokens[i:j]))
                 i = j
             else:
-                # Not a sequence, just append the token
                 out.append(tokens[i])
                 i += 1
         else:
@@ -81,22 +79,19 @@ def normalize_email_tokens(s: str) -> str:
     s2 = s
     s2 = collapse_spelled_letters(s2)
     for pat, rep in EMAIL_TOKEN_PATTERNS:
-        s2 = re.sub(pat, rep, s2, flags=re.IGNORECASE)
+        s2 = pat.sub(rep, s2)
     for pat, rep in EMAIL_CLEANUP_PATTERNS:
-        s2 = re.sub(pat, rep, s2)
+        s2 = pat.sub(rep, s2)
     return s2
 
-# --- 3. Number Normalization (BUGFIX + Feature) ---
+# --- 4. Number Normalization ---
 NUM_WORD = {
     'zero':'0', 'oh':'0', 'one':'1', 'two':'2', 'three':'3', 'four':'4', 'five':'5',
     'six':'6', 'seven':'7', 'eight':'8', 'nine':'9'
 }
 
 def words_to_digits(seq: List[str]) -> Tuple[str, int]:
-    """
-    Improved: Returns the digit string AND number of tokens consumed.
-    This fixes a major bug in the original normalize_numbers_spoken.
-    """
+    # (Your function is good, keep as-is)
     out = []
     i = 0
     while i < len(seq):
@@ -109,31 +104,21 @@ def words_to_digits(seq: List[str]) -> Tuple[str, int]:
                 i += 2
                 continue
             else:
-                # 'double' wasn't followed by a num, stop
                 break
-        
         if tok in NUM_WORD:
             out.append(NUM_WORD[tok])
             i += 1
         else:
-            # Stop on first non-number word
             break
-    return ''.join(out), i # Return (digits, tokens_consumed)
+    return ''.join(out), i
 
 def normalize_numbers_spoken(s: str) -> str:
-    """
-    Improved: Correctly consumes tokens and handles sequences of any length.
-    """
+    # (Your function is good, keep as-is)
     tokens = s.split()
     out = []
     i = 0
     while i < len(tokens):
-        # Pass the *rest* of the tokens to words_to_digits
         digits, consumed = words_to_digits(tokens[i:])
-        
-        # Heuristic: only collapse if it forms a number-like sequence
-        # (e.g., phone number, ID) of 2+ digits.
-        # This avoids "i need one apple" -> "i need 1 apple"
         if consumed > 0 and len(digits) >= 2:
             out.append(digits)
             i += consumed
@@ -142,20 +127,9 @@ def normalize_numbers_spoken(s: str) -> str:
             i += 1
     return ' '.join(out)
 
-# --- 4. Currency Normalization (Feature + Performance) ---
-INDIAN_UNITS = {
-    'lakh': 100000,
-    'crore': 10000000,
-}
+INDIAN_UNITS = {'lakh': 100000, 'crore': 10000000}
 
 def normalize_indian_units(s: str) -> str:
-    """
-    (NEW) Handles 'lakh' and 'crore' units.
-    e.g., "two lakh fifty thousand" -> "250000"
-    e.g., "5 crore" -> "50000000"
-    """
-    # This is a simplified version. A full-blown parser is complex.
-    # It handles "X unit" (e.g., "5 crore") and "X.Y unit" (e.g., "2.5 lakh")
     def unit_replacer(m):
         try:
             value = float(m.group(1))
@@ -165,71 +139,52 @@ def normalize_indian_units(s: str) -> str:
         except:
             return m.group(0)
 
-    # First, simple number words
-    s = re.sub(r'\bone\b', '1', s, flags=re.IGNORECASE)
-    s = re.sub(r'\btwo\b', '2', s, flags=re.IGNORECASE)
-    # ... (add more common small numbers as needed)
+    for pat, rep in SMALL_NUM_PATTERNS:
+        s = pat.sub(rep, s)
     
-    # Then, units
-    pattern = re.compile(r'(\d[\d,.]*)\s+(lakh|crore)\b', re.IGNORECASE)
-    s = pattern.sub(unit_replacer, s)
-    
-    # Handle "thousand" (e.g., "2 lakh 50 thousand" -> "200000 50 thousand")
-    # A simple fix: "250 thousand" -> "250000"
-    s = re.sub(r'(\d[\d,.]*)\s+thousand\b', lambda m: str(int(float(m.group(1)) * 1000)), s, flags=re.IGNORECASE)
+    s = INDIAN_UNIT_PATTERN.sub(unit_replacer, s)
+    s = THOUSAND_PATTERN.sub(lambda m: str(int(float(m.group(1)) * 1000)), s)
     return s
 
 def indian_group(num_str: str) -> str:
-    """
-    (Improved) Faster regex-based grouping for Indian style (..XX,XX,XXX)
-    """
-    if not num_str.isdigit(): return num_str
-    if len(num_str) <= 3:
+    if not num_str.isdigit() or len(num_str) <= 3:
         return num_str
     
     last3 = num_str[-3:]
     rest = num_str[:-3]
-    # Add commas to 'rest' at every 2nd digit from the right
-    grouped_rest = re.sub(r'(\d)(?=(\d\d)+\d$)', r'\1,', rest)
+    grouped_rest = INDIAN_GROUPING_PATTERN.sub(r'\1,', rest)
     return grouped_rest + ',' + last3
 
 def normalize_currency(s: str) -> str:
-    # 1. First, convert "two lakh" to "200000"
     s = normalize_indian_units(s)
+    s = CURRENCY_SYMBOL_PATTERN.sub('₹', s)
     
-    # 2. Add '₹' symbol
-    s = re.sub(r'\b(rupees|rs)\b\s*', '₹', s, flags=re.IGNORECASE)
-    
-    # 3. Apply Indian grouping to numbers following '₹'
     def repl(m):
-        # m.group(1) is '₹'
-        # m.group(2) is the number (e.g., '200000')
-        raw_num = m.group(2).replace(',', '') # remove existing commas
+        raw_num = m.group(2).replace(',', '')
         if raw_num.isdigit():
             return '₹' + indian_group(raw_num)
-        return m.group(0) # Not a clean int, leave it
+        return m.group(0)
 
-    s = re.sub(r'(₹)\s*([0-9,]+)\b', repl, s)
+    s = CURRENCY_FORMAT_PATTERN.sub(repl, s)
     return s
 
 # --- 5. Name Correction (Performance) ---
 def correct_names_with_lexicon(s: str, names_lex: List[str], threshold: int = 90) -> str:
-    """
-    (Improved) Pre-filters tokens to avoid running fuzzy search on
-    punctuation, digits, or common short words, which is slow.
-    """
     tokens = s.split()
     out = []
     for t in tokens:
-        # (NEW) Performance guard:
-        # Only check alpha tokens longer than 2 chars
-        if not t.isalpha() or len(t) <= 2:
+        # (LATENCY FIX) Strip punctuation *before* the check
+        clean_t = t.strip('.,?!')
+        
+        # Guard condition to skip slow fuzzy search
+        if not clean_t.isalpha() or len(clean_t) <= 2:
             out.append(t)
             continue
             
-        best = process.extractOne(t, names_lex, scorer=fuzz.ratio)
+        best = process.extractOne(clean_t, names_lex, scorer=fuzz.ratio)
         if best and best[1] >= threshold:
-            out.append(best[0]) # Use the correct lexicon spelling
+            # Re-apply punctuation by replacing the clean part
+            out.append(t.replace(clean_t, best[0]))
         else:
             out.append(t)
     return ' '.join(out)
@@ -240,14 +195,6 @@ def generate_candidates(
     names_lex: List[str], 
     misspell_map: Dict[str, str]
 ) -> List[str]:
-    """
-    (Improved) Generates a more diverse and logical set of candidates.
-    - Applies high-precision misspell correction first.
-    - Creates a 'full' pipeline candidate.
-    - Creates 'ablation' candidates (no_names, no_numbers)
-      to let the ranker choose.
-    - Caps candidates at 5.
-    """
     cands: Set[str] = set()
     cands.add(text) # Always include original
 
@@ -262,13 +209,13 @@ def generate_candidates(
     t_full = correct_names_with_lexicon(t_full, names_lex)
     cands.add(t_full)
 
-    # 3. Ablation: No Name Correction (in case names are wrong)
+    # 3. Ablation: No Name Correction
     t_no_names = normalize_email_tokens(t_base)
     t_no_names = normalize_numbers_spoken(t_no_names)
     t_no_names = normalize_currency(t_no_names)
     cands.add(t_no_names)
 
-    # 4. Ablation: No Number/Currency Correction (in case numbers are wrong)
+    # 4. Ablation: No Number/Currency Correction
     t_no_nums = normalize_email_tokens(t_base)
     t_no_nums = correct_names_with_lexicon(t_no_nums, names_lex)
     cands.add(t_no_nums)
